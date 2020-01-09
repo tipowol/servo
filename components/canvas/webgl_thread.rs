@@ -60,12 +60,12 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use surfman;
-use surfman::platform::generic::universal::adapter::Adapter;
-use surfman::platform::generic::universal::connection::Connection;
-use surfman::platform::generic::universal::context::Context;
-use surfman::platform::generic::universal::device::Device;
+use surfman::Adapter;
+use surfman::Connection;
+use surfman::Context;
 use surfman::ContextAttributeFlags;
 use surfman::ContextAttributes;
+use surfman::Device;
 use surfman::GLVersion;
 use surfman::SurfaceAccess;
 use surfman::SurfaceInfo;
@@ -87,16 +87,66 @@ struct GLContextData {
     attributes: GLContextAttributes,
 }
 
+#[derive(Debug)]
 pub struct GLState {
     webgl_version: WebGLVersion,
     gl_version: GLVersion,
+    requested_flags: ContextAttributeFlags,
+    // This is the WebGL view of the color mask
+    // The GL view may be different: if the GL context supports alpha
+    // but the WebGL context doesn't, then color_write_mask.3 might be true
+    // but the GL color write mask is false.
+    color_write_mask: [bool; 4],
     clear_color: (f32, f32, f32, f32),
     scissor_test_enabled: bool,
+    // The WebGL view of the stencil write mask (see comment re `color_write_mask`)
     stencil_write_mask: (u32, u32),
     stencil_clear_value: i32,
+    // The WebGL view of the depth write mask (see comment re `color_write_mask`)
     depth_write_mask: bool,
     depth_clear_value: f64,
+    // True when the default framebuffer is bound to DRAW_FRAMEBUFFER
+    drawing_to_default_framebuffer: bool,
     default_vao: gl::GLuint,
+}
+
+impl GLState {
+    // We maintain an invariant that GL's color write mask is state.gl_color_write_mask()
+    fn gl_color_write_mask(&self) -> [bool; 4] {
+        if !self.drawing_to_default_framebuffer {
+            self.color_write_mask
+        } else if self.requested_flags.contains(ContextAttributeFlags::ALPHA) {
+            self.color_write_mask
+        } else {
+            let [r, g, b, _] = self.color_write_mask;
+            [r, g, b, false]
+        }
+    }
+
+    // We maintain an invariant that GL's depth write mask is state.gl_depth_write_mask()
+    fn gl_depth_write_mask(&self) -> bool {
+        if !self.drawing_to_default_framebuffer {
+            self.depth_write_mask
+        } else if self.requested_flags.contains(ContextAttributeFlags::DEPTH) {
+            self.depth_write_mask
+        } else {
+            false
+        }
+    }
+
+    // We maintain an invariant that GL's stencil write mask is state.gl_stencil_write_mask()
+    fn gl_stencil_write_mask(&self) -> (u32, u32) {
+        if !self.drawing_to_default_framebuffer {
+            self.stencil_write_mask
+        } else if self
+            .requested_flags
+            .contains(ContextAttributeFlags::STENCIL)
+        {
+            self.stencil_write_mask
+        } else {
+            (0, 0)
+        }
+    }
 }
 
 impl Default for GLState {
@@ -104,13 +154,17 @@ impl Default for GLState {
         GLState {
             gl_version: GLVersion { major: 1, minor: 0 },
             webgl_version: WebGLVersion::WebGL1,
+            requested_flags: ContextAttributeFlags::empty(),
+            color_write_mask: [true, true, true, true],
             clear_color: (0., 0., 0., 0.),
             scissor_test_enabled: false,
+            // Should these be 0xFFFF_FFFF?
             stencil_write_mask: (0, 0),
             stencil_clear_value: 0,
             depth_write_mask: true,
             depth_clear_value: 1.,
             default_vao: 0,
+            drawing_to_default_framebuffer: true,
         }
     }
 }
@@ -142,9 +196,9 @@ pub(crate) struct WebGLThread {
     /// The receiver that should be used to send WebGL messages for processing.
     sender: WebGLSender<WebGLMsg>,
     /// The swap chains used by webrender
-    webrender_swap_chains: SwapChains<WebGLContextId>,
+    webrender_swap_chains: SwapChains<WebGLContextId, Device>,
     /// The swap chains used by webxr
-    webxr_swap_chains: SwapChains<WebXRSwapChainId>,
+    webxr_swap_chains: SwapChains<WebXRSwapChainId, Device>,
     /// Whether this context is a GL or GLES context.
     api_type: gl::GlType,
 }
@@ -162,8 +216,8 @@ pub(crate) struct WebGLThreadInit {
     pub external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
     pub sender: WebGLSender<WebGLMsg>,
     pub receiver: WebGLReceiver<WebGLMsg>,
-    pub webrender_swap_chains: SwapChains<WebGLContextId>,
-    pub webxr_swap_chains: SwapChains<WebXRSwapChainId>,
+    pub webrender_swap_chains: SwapChains<WebGLContextId, Device>,
+    pub webxr_swap_chains: SwapChains<WebXRSwapChainId, Device>,
     pub connection: Connection,
     pub adapter: Adapter,
     pub api_type: gl::GlType,
@@ -220,7 +274,9 @@ impl WebGLThread {
         }: WebGLThreadInit,
     ) -> Self {
         WebGLThread {
-            device: Device::new(&connection, &adapter).expect("Couldn't open WebGL device!"),
+            device: connection
+                .create_device(&adapter)
+                .expect("Couldn't open WebGL device!"),
             webrender_api: webrender_api_sender.create_api(),
             contexts: Default::default(),
             cached_context_info: Default::default(),
@@ -419,21 +475,26 @@ impl WebGLThread {
         requested_size: Size2D<u32>,
         attributes: GLContextAttributes,
     ) -> Result<(WebGLContextId, webgl::GLLimits), String> {
-        debug!("WebGLThread::create_webgl_context({:?})", requested_size);
+        debug!(
+            "WebGLThread::create_webgl_context({:?}, {:?}, {:?})",
+            webgl_version, requested_size, attributes
+        );
 
         // Creating a new GLContext may make the current bound context_id dirty.
         // Clear it to ensure that  make_current() is called in subsequent commands.
         self.bound_context_id = None;
 
+        let requested_flags =
+            attributes.to_surfman_context_attribute_flags(webgl_version, self.api_type);
         let context_attributes = &ContextAttributes {
-            version: webgl_version.to_surfman_version(),
-            flags: attributes.to_surfman_context_attribute_flags(webgl_version),
+            version: webgl_version.to_surfman_version(self.api_type),
+            flags: requested_flags,
         };
 
         let context_descriptor = self
             .device
             .create_context_descriptor(&context_attributes)
-            .unwrap();
+            .expect("Failed to create context descriptor");
 
         let safe_size = Size2D::new(
             requested_size.width.min(SAFE_VIEWPORT_DIMS[0]).max(1),
@@ -450,7 +511,7 @@ impl WebGLThread {
             .expect("Failed to create the GL context!");
         let surface = self
             .device
-            .create_surface(&ctx, surface_access, &surface_type)
+            .create_surface(&ctx, surface_access, surface_type)
             .expect("Failed to create the initial surface!");
         self.device
             .bind_surface_to_context(&mut ctx, surface)
@@ -480,7 +541,7 @@ impl WebGLThread {
         debug!(
             "Created webgl context {:?}/{:?}",
             id,
-            self.device.context_id(&ctx)
+            self.device.context_id(&ctx),
         );
 
         let gl = match self.api_type {
@@ -502,6 +563,12 @@ impl WebGLThread {
                 .expect("Failed to resize swap chain");
         }
 
+        let descriptor = self.device.context_descriptor(&ctx);
+        let descriptor_attributes = self.device.context_descriptor_attributes(&descriptor);
+        let gl_version = descriptor_attributes.version;
+        let has_alpha = requested_flags.contains(ContextAttributeFlags::ALPHA);
+        let texture_target = current_wr_texture_target(&self.device);
+
         self.device.make_context_current(&ctx).unwrap();
         let framebuffer = self
             .device
@@ -509,23 +576,16 @@ impl WebGLThread {
             .unwrap()
             .unwrap()
             .framebuffer_object;
+
         gl.bind_framebuffer(gl::FRAMEBUFFER, framebuffer);
         gl.viewport(0, 0, size.width as i32, size.height as i32);
         gl.scissor(0, 0, size.width as i32, size.height as i32);
-        gl.clear_color(0., 0., 0., 0.);
+        gl.clear_color(0., 0., 0., !has_alpha as u32 as f32);
         gl.clear_depth(1.);
         gl.clear_stencil(0);
         gl.clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT | gl::STENCIL_BUFFER_BIT);
+        gl.clear_color(0., 0., 0., 0.);
         debug_assert_eq!(gl.get_error(), gl::NO_ERROR);
-
-        let descriptor = self.device.context_descriptor(&ctx);
-        let descriptor_attributes = self.device.context_descriptor_attributes(&descriptor);
-
-        let gl_version = descriptor_attributes.version;
-        let has_alpha = descriptor_attributes
-            .flags
-            .contains(ContextAttributeFlags::ALPHA);
-        let texture_target = current_wr_texture_target(&self.device);
 
         let use_apple_vertex_array = WebGLImpl::needs_apple_vertex_arrays(gl_version);
         let default_vao = if let Some(vao) =
@@ -541,9 +601,24 @@ impl WebGLThread {
         let state = GLState {
             gl_version,
             webgl_version,
+            requested_flags,
             default_vao,
             ..Default::default()
         };
+        debug!("Created state {:?}", state);
+
+        let [r, g, b, a] = state.gl_color_write_mask();
+        debug!("Setting color mask to {:?}", (r, g, b, a));
+        gl.color_mask(r, g, b, a);
+        let d = state.gl_depth_write_mask();
+        debug!("Setting depth mask to {:?}", d);
+        gl.depth_mask(d);
+        let (f, b) = state.gl_stencil_write_mask();
+        debug!("Setting stencil mask to {:?}", (f, b));
+        gl.stencil_mask_separate(gl::FRONT, f);
+        gl.stencil_mask_separate(gl::BACK, b);
+        debug_assert_eq!(gl.get_error(), gl::NO_ERROR);
+
         self.contexts.insert(
             id,
             GLContextData {
@@ -592,15 +667,16 @@ impl WebGLThread {
 
         // Resize the swap chains
         if let Some(swap_chain) = self.webrender_swap_chains.get(context_id) {
+            let alpha = data
+                .state
+                .requested_flags
+                .contains(ContextAttributeFlags::ALPHA);
+            let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
             swap_chain
                 .resize(&mut self.device, &mut data.ctx, size.to_i32())
                 .expect("Failed to resize swap chain");
-            // temporary, till https://github.com/pcwalton/surfman/issues/35 is fixed
-            self.device
-                .make_context_current(&data.ctx)
-                .expect("Failed to make context current again");
             swap_chain
-                .clear_surface(&mut self.device, &mut data.ctx, &*data.gl)
+                .clear_surface(&mut self.device, &mut data.ctx, &*data.gl, clear_color)
                 .expect("Failed to clear resized swap chain");
         } else {
             error!("Failed to find swap chain");
@@ -611,11 +687,9 @@ impl WebGLThread {
 
         // Update WR image if needed.
         let info = self.cached_context_info.get_mut(&context_id).unwrap();
-        let context_descriptor = self.device.context_descriptor(&data.ctx);
-        let has_alpha = self
-            .device
-            .context_descriptor_attributes(&context_descriptor)
-            .flags
+        let has_alpha = data
+            .state
+            .requested_flags
             .contains(ContextAttributeFlags::ALPHA);
         let texture_target = current_wr_texture_target(&self.device);
         Self::update_wr_external_image(
@@ -721,8 +795,13 @@ impl WebGLThread {
             // TODO: if preserveDrawingBuffer is true, then blit the front buffer to the back buffer
             // https://github.com/servo/servo/issues/24604
             debug!("Clearing {:?}", swap_id);
+            let alpha = data
+                .state
+                .requested_flags
+                .contains(ContextAttributeFlags::ALPHA);
+            let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
             swap_chain
-                .clear_surface(&mut self.device, &mut data.ctx, &*data.gl)
+                .clear_surface(&mut self.device, &mut data.ctx, &*data.gl, clear_color)
                 .unwrap();
             debug_assert_eq!(data.gl.get_error(), gl::NO_ERROR);
 
@@ -1101,7 +1180,12 @@ impl WebGLImpl {
                 state.stencil_clear_value = stencil;
                 gl.clear_stencil(stencil);
             },
-            WebGLCommand::ColorMask(r, g, b, a) => gl.color_mask(r, g, b, a),
+            WebGLCommand::ColorMask(r, g, b, a) => {
+                state.color_write_mask = [r, g, b, a];
+                let [r, g, b, a] = state.gl_color_write_mask();
+                debug!("Setting color mask to {:?}", (r, g, b, a));
+                gl.color_mask(r, g, b, a);
+            },
             WebGLCommand::CopyTexImage2D(
                 target,
                 level,
@@ -1126,6 +1210,8 @@ impl WebGLImpl {
             WebGLCommand::DepthFunc(func) => gl.depth_func(func),
             WebGLCommand::DepthMask(flag) => {
                 state.depth_write_mask = flag;
+                let flag = state.gl_depth_write_mask();
+                debug!("Setting depth mask to {:?}", flag);
                 gl.depth_mask(flag);
             },
             WebGLCommand::DepthRange(near, far) => {
@@ -1225,15 +1311,19 @@ impl WebGLImpl {
             },
             WebGLCommand::StencilMask(mask) => {
                 state.stencil_write_mask = (mask, mask);
+                let (mask, _) = state.gl_stencil_write_mask();
                 gl.stencil_mask(mask);
             },
             WebGLCommand::StencilMaskSeparate(face, mask) => {
                 if face == gl::FRONT {
                     state.stencil_write_mask.0 = mask;
+                    let (mask, _) = state.gl_stencil_write_mask();
+                    gl.stencil_mask_separate(face, mask);
                 } else {
                     state.stencil_write_mask.1 = mask;
+                    let (_, mask) = state.gl_stencil_write_mask();
+                    gl.stencil_mask_separate(face, mask);
                 }
-                gl.stencil_mask_separate(face, mask);
             },
             WebGLCommand::StencilOp(fail, zfail, zpass) => gl.stencil_op(fail, zfail, zpass),
             WebGLCommand::StencilOpSeparate(face, fail, zfail, zpass) => {
@@ -1320,7 +1410,7 @@ impl WebGLImpl {
                 gl.bind_buffer(target, id.map_or(0, WebGLBufferId::get))
             },
             WebGLCommand::BindFramebuffer(target, request) => {
-                Self::bind_framebuffer(gl, target, request, ctx, device)
+                Self::bind_framebuffer(gl, target, request, ctx, device, state)
             },
             WebGLCommand::BindRenderbuffer(target, id) => {
                 gl.bind_renderbuffer(target, id.map_or(0, WebGLRenderbufferId::get))
@@ -1550,11 +1640,15 @@ impl WebGLImpl {
                 Self::bind_vertex_array(gl, id, use_apple_vertex_array, state.webgl_version);
             },
             WebGLCommand::GetParameterBool(param, ref sender) => {
-                let mut value = [0];
-                unsafe {
-                    gl.get_boolean_v(param as u32, &mut value);
-                }
-                sender.send(value[0] != 0).unwrap()
+                let value = match param {
+                    webgl::ParameterBool::DepthWritemask => state.depth_write_mask,
+                    _ => unsafe {
+                        let mut value = [0];
+                        gl.get_boolean_v(param as u32, &mut value);
+                        value[0] != 0
+                    },
+                };
+                sender.send(value).unwrap()
             },
             WebGLCommand::FenceSync(ref sender) => {
                 let value = gl.fence_sync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -1581,19 +1675,39 @@ impl WebGLImpl {
                 gl.delete_sync(sync_id.get() as *const _);
             },
             WebGLCommand::GetParameterBool4(param, ref sender) => {
-                let mut value = [0; 4];
-                unsafe {
-                    gl.get_boolean_v(param as u32, &mut value);
-                }
-                let value = [value[0] != 0, value[1] != 0, value[2] != 0, value[3] != 0];
+                let value = match param {
+                    webgl::ParameterBool4::ColorWritemask => state.color_write_mask,
+                };
                 sender.send(value).unwrap()
             },
             WebGLCommand::GetParameterInt(param, ref sender) => {
-                let mut value = [0];
-                unsafe {
-                    gl.get_integer_v(param as u32, &mut value);
-                }
-                sender.send(value[0]).unwrap()
+                let value = match param {
+                    webgl::ParameterInt::AlphaBits
+                        if !state.requested_flags.contains(ContextAttributeFlags::ALPHA) =>
+                    {
+                        0
+                    },
+                    webgl::ParameterInt::DepthBits
+                        if !state.requested_flags.contains(ContextAttributeFlags::DEPTH) =>
+                    {
+                        0
+                    },
+                    webgl::ParameterInt::StencilBits
+                        if !state
+                            .requested_flags
+                            .contains(ContextAttributeFlags::STENCIL) =>
+                    {
+                        0
+                    },
+                    webgl::ParameterInt::StencilWritemask => state.stencil_write_mask.0 as i32,
+                    webgl::ParameterInt::StencilBackWritemask => state.stencil_write_mask.1 as i32,
+                    _ => unsafe {
+                        let mut value = [0];
+                        gl.get_integer_v(param as u32, &mut value);
+                        value[0]
+                    },
+                };
+                sender.send(value).unwrap()
             },
             WebGLCommand::GetParameterInt2(param, ref sender) => {
                 let mut value = [0; 2];
@@ -1948,15 +2062,25 @@ impl WebGLImpl {
                 sender.send(value).unwrap();
             },
             WebGLCommand::BindBufferBase(target, index, id) => {
-                gl.bind_buffer_base(target, index, id.map_or(0, WebGLBufferId::get))
+                // https://searchfox.org/mozilla-central/rev/13b081a62d3f3e3e3120f95564529257b0bf451c/dom/canvas/WebGLContextBuffers.cpp#208-210
+                // BindBufferBase/Range will fail (on some drivers) if the buffer name has
+                // never been bound. (GenBuffers makes a name, but BindBuffer initializes
+                // that name as a real buffer object)
+                let id = id.map_or(0, WebGLBufferId::get);
+                gl.bind_buffer(target, id);
+                gl.bind_buffer(target, 0);
+                gl.bind_buffer_base(target, index, id);
             },
-            WebGLCommand::BindBufferRange(target, index, id, offset, size) => gl.bind_buffer_range(
-                target,
-                index,
-                id.map_or(0, WebGLBufferId::get),
-                offset as isize,
-                size as isize,
-            ),
+            WebGLCommand::BindBufferRange(target, index, id, offset, size) => {
+                // https://searchfox.org/mozilla-central/rev/13b081a62d3f3e3e3120f95564529257b0bf451c/dom/canvas/WebGLContextBuffers.cpp#208-210
+                // BindBufferBase/Range will fail (on some drivers) if the buffer name has
+                // never been bound. (GenBuffers makes a name, but BindBuffer initializes
+                // that name as a real buffer object)
+                let id = id.map_or(0, WebGLBufferId::get);
+                gl.bind_buffer(target, id);
+                gl.bind_buffer(target, 0);
+                gl.bind_buffer_range(target, index, id, offset as isize, size as isize);
+            },
             WebGLCommand::ClearBufferfv(buffer, draw_buffer, ref value) => {
                 gl.clear_buffer_fv(buffer, draw_buffer, value)
             },
@@ -2038,6 +2162,7 @@ impl WebGLImpl {
         }
 
         if color {
+            gl.color_mask(true, true, true, true);
             gl.clear_color(0., 0., 0., 0.);
         }
 
@@ -2059,17 +2184,23 @@ impl WebGLImpl {
         }
 
         if color {
+            let [r, g, b, a] = state.gl_color_write_mask();
+            debug!("Setting color mask to {:?}", (r, g, b, a));
+            gl.color_mask(r, g, b, a);
             let (r, g, b, a) = state.clear_color;
             gl.clear_color(r, g, b, a);
         }
 
         if depth {
-            gl.depth_mask(state.depth_write_mask);
+            let mask = state.gl_depth_write_mask();
+            debug!("Setting depth mask to {:?}", mask);
+            gl.depth_mask(mask);
             gl.clear_depth(state.depth_clear_value);
         }
 
         if stencil {
-            let (front, back) = state.stencil_write_mask;
+            let (front, back) = state.gl_stencil_write_mask();
+            debug!("Setting stencil mask to {:?}", (front, back));
             gl.stencil_mask_separate(gl::FRONT, front);
             gl.stencil_mask_separate(gl::BACK, back);
             gl.clear_stencil(state.stencil_clear_value);
@@ -2180,6 +2311,7 @@ impl WebGLImpl {
                 &mut transform_feedback_mode,
             );
         }
+
         ProgramLinkInfo {
             linked: true,
             active_attribs,
@@ -2395,8 +2527,8 @@ impl WebGLImpl {
     /// Updates the swap buffers if the context surface needs to be changed
     fn attach_surface(
         context_id: WebGLContextId,
-        webrender_swap_chains: &SwapChains<WebGLContextId>,
-        webxr_swap_chains: &SwapChains<WebXRSwapChainId>,
+        webrender_swap_chains: &SwapChains<WebGLContextId, Device>,
+        webxr_swap_chains: &SwapChains<WebXRSwapChainId, Device>,
         request: WebGLFramebufferBindingRequest,
         ctx: &mut Context,
         device: &mut Device,
@@ -2447,6 +2579,7 @@ impl WebGLImpl {
         request: WebGLFramebufferBindingRequest,
         ctx: &Context,
         device: &Device,
+        state: &mut GLState,
     ) {
         let id = match request {
             WebGLFramebufferBindingRequest::Explicit(WebGLFramebufferId::Transparent(id)) => {
@@ -2464,6 +2597,21 @@ impl WebGLImpl {
 
         debug!("WebGLImpl::bind_framebuffer: {:?}", id);
         gl.bind_framebuffer(target, id);
+
+        if (target == gl::FRAMEBUFFER) || (target == gl::DRAW_FRAMEBUFFER) {
+            state.drawing_to_default_framebuffer =
+                request == WebGLFramebufferBindingRequest::Default;
+            let [r, g, b, a] = state.gl_color_write_mask();
+            debug!("Setting color mask to {:?}", (r, g, b, a));
+            gl.color_mask(r, g, b, a);
+            let d = state.gl_depth_write_mask();
+            debug!("Setting depth mask to {:?}", d);
+            gl.depth_mask(d);
+            let (f, b) = state.gl_stencil_write_mask();
+            debug!("Setting stencil mask to {:?}", (f, b));
+            gl.stencil_mask_separate(gl::FRONT, f);
+            gl.stencil_mask_separate(gl::BACK, b);
+        }
     }
 
     #[inline]
@@ -2866,11 +3014,14 @@ fn clamp_viewport(gl: &Gl, size: Size2D<u32>) -> Size2D<u32> {
 }
 
 trait ToSurfmanVersion {
-    fn to_surfman_version(self) -> GLVersion;
+    fn to_surfman_version(self, api_type: gl::GlType) -> GLVersion;
 }
 
 impl ToSurfmanVersion for WebGLVersion {
-    fn to_surfman_version(self) -> GLVersion {
+    fn to_surfman_version(self, api_type: gl::GlType) -> GLVersion {
+        if api_type == gl::GlType::Gles {
+            return GLVersion::new(3, 0);
+        }
         match self {
             WebGLVersion::WebGL1 => GLVersion::new(2, 0),
             WebGLVersion::WebGL2 => GLVersion::new(3, 0),
@@ -2882,6 +3033,7 @@ trait SurfmanContextAttributeFlagsConvert {
     fn to_surfman_context_attribute_flags(
         &self,
         webgl_version: WebGLVersion,
+        api_type: gl::GlType,
     ) -> ContextAttributeFlags;
 }
 
@@ -2889,12 +3041,13 @@ impl SurfmanContextAttributeFlagsConvert for GLContextAttributes {
     fn to_surfman_context_attribute_flags(
         &self,
         webgl_version: WebGLVersion,
+        api_type: gl::GlType,
     ) -> ContextAttributeFlags {
         let mut flags = ContextAttributeFlags::empty();
         flags.set(ContextAttributeFlags::ALPHA, self.alpha);
         flags.set(ContextAttributeFlags::DEPTH, self.depth);
         flags.set(ContextAttributeFlags::STENCIL, self.stencil);
-        if webgl_version == WebGLVersion::WebGL1 {
+        if (webgl_version == WebGLVersion::WebGL1) && (api_type == gl::GlType::Gl) {
             flags.set(ContextAttributeFlags::COMPATIBILITY_PROFILE, true);
         }
         flags
