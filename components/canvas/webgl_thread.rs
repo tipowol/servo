@@ -3023,8 +3023,11 @@ impl ToSurfmanVersion for WebGLVersion {
             return GLVersion::new(3, 0);
         }
         match self {
-            WebGLVersion::WebGL1 => GLVersion::new(2, 0),
-            WebGLVersion::WebGL2 => GLVersion::new(3, 0),
+            // We make use of GL_PACK_PIXEL_BUFFER, which needs at least GL2.1
+            // We make use of compatibility mode, which needs at most GL3.0
+            WebGLVersion::WebGL1 => GLVersion::new(2, 1),
+            // The WebGL2 conformance tests use std140 layout, which needs at GL3.1
+            WebGLVersion::WebGL2 => GLVersion::new(3, 2),
         }
     }
 }
