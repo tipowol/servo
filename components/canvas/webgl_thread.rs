@@ -3010,8 +3010,14 @@ fn clamp_viewport(gl: &Gl, size: Size2D<u32>) -> Size2D<u32> {
         debug_assert_eq!(gl.get_error(), gl::NO_ERROR);
     }
     Size2D::new(
-        size.width.min(max_viewport[0] as u32).min(max_renderbuffer[0] as u32).max(1),
-        size.height.min(max_viewport[1] as u32).min(max_renderbuffer[0] as u32).max(1),
+        size.width
+            .min(max_viewport[0] as u32)
+            .min(max_renderbuffer[0] as u32)
+            .max(1),
+        size.height
+            .min(max_viewport[1] as u32)
+            .min(max_renderbuffer[0] as u32)
+            .max(1),
     )
 }
 
