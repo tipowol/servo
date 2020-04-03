@@ -253,6 +253,7 @@ impl CompiledEventListener {
 struct EventListenerEntry {
     phase: ListenerPhase,
     listener: EventListenerType,
+    passive: bool,
     once: bool,
 }
 
@@ -409,6 +410,7 @@ impl EventTarget {
                     entries.push(EventListenerEntry {
                         phase: ListenerPhase::Bubbling,
                         listener: EventListenerType::Inline(listener),
+                        passive: false,
                         once: false,
                     });
                 }
@@ -704,6 +706,7 @@ impl EventTarget {
         let new_entry = EventListenerEntry {
             phase: phase,
             listener: EventListenerType::Additive(listener),
+            passive: options.passive,
             once: options.once,
         };
         if !entry.contains(&new_entry) {
@@ -733,6 +736,7 @@ impl EventTarget {
             let old_entry = EventListenerEntry {
                 phase: phase,
                 listener: EventListenerType::Additive(listener.clone()),
+                passive: false,
                 once: false,
             };
             if let Some(position) = entry.iter().position(|e| *e == old_entry) {
@@ -788,6 +792,7 @@ impl From<AddEventListenerOptionsOrBoolean> for AddEventListenerOptions {
             AddEventListenerOptionsOrBoolean::AddEventListenerOptions(options) => options,
             AddEventListenerOptionsOrBoolean::Boolean(capture) => Self {
                 parent: EventListenerOptions { capture },
+                passive: false,
                 once: false,
             },
         }

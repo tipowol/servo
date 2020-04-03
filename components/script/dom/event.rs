@@ -43,6 +43,7 @@ pub struct Event {
     canceled: Cell<EventDefault>,
     stop_propagation: Cell<bool>,
     stop_immediate: Cell<bool>,
+    in_passive_listener: Cell<bool>,
     cancelable: Cell<bool>,
     bubbles: Cell<bool>,
     trusted: Cell<bool>,
@@ -62,6 +63,7 @@ impl Event {
             canceled: Cell::new(EventDefault::Allowed),
             stop_propagation: Cell::new(false),
             stop_immediate: Cell::new(false),
+            in_passive_listener: Cell::new(false),
             cancelable: Cell::new(false),
             bubbles: Cell::new(false),
             trusted: Cell::new(false),
@@ -105,6 +107,7 @@ impl Event {
         self.initialized.set(true);
         self.stop_propagation.set(false);
         self.stop_immediate.set(false);
+        self.in_passive_listener.set(false);
         self.canceled.set(EventDefault::Allowed);
         self.trusted.set(false);
         self.target.set(None);
@@ -424,7 +427,7 @@ impl EventMethods for Event {
 
     // https://dom.spec.whatwg.org/#dom-event-preventdefault
     fn PreventDefault(&self) {
-        if self.cancelable.get() {
+        if self.cancelable.get() && !self.in_passive_listener.get() {
             self.canceled.set(EventDefault::Prevented)
         }
     }
@@ -696,7 +699,10 @@ fn inner_invoke(
         // value of its .event. This allows events to just use
         // the word "event" instead of taking the event as an argument.
 
-        // Step 2.9 TODO: EventListener passive option not implemented
+        // Step 2.9
+        if listener.passive {
+            event.in_passive_listener.set(true);
+        }
 
         // Step 2.10
         let marker = TimelineMarker::start("DOMEvent".to_owned());
@@ -708,7 +714,8 @@ fn inner_invoke(
             window.emit_timeline_marker(marker.end());
         }
 
-        // Step 2.11 TODO: passive not implemented
+        // Step 2.11
+        event.in_passive_listener.set(false);
 
         // Step 2.12
         // TODO This is where we put back the .event we

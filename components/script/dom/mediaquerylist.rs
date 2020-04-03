@@ -94,6 +94,7 @@ impl MediaQueryListMethods for MediaQueryList {
             listener,
             AddEventListenerOptions {
                 parent: EventListenerOptions { capture: false },
+                passive: false,
                 once: false,
             },
         );
