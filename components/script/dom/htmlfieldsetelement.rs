@@ -37,7 +37,7 @@ impl HTMLFieldSetElement {
     ) -> HTMLFieldSetElement {
         HTMLFieldSetElement {
             htmlelement: HTMLElement::new_inherited_with_state(
-                ElementState::IN_ENABLED_STATE,
+                ElementState::IN_ENABLED_STATE | ElementState::IN_VALID_STATE,
                 local_name,
                 prefix,
                 document,
@@ -59,6 +59,26 @@ impl HTMLFieldSetElement {
             )),
             document,
         )
+    }
+
+    pub fn update_validity(&self) {
+        let has_invalid_child = self
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::No)
+            .flat_map(DomRoot::downcast::<Element>)
+            .any(|element| {
+                if let Some(validatable) = element.as_maybe_validatable() {
+                    validatable.is_instance_validatable() &&
+                        !validatable.validity_state().invalid_flags().is_empty()
+                } else {
+                    false
+                }
+            });
+
+        self.upcast::<Element>()
+            .set_state(ElementState::IN_VALID_STATE, !has_invalid_child);
+        self.upcast::<Element>()
+            .set_state(ElementState::IN_INVALID_STATE, has_invalid_child);
     }
 }
 

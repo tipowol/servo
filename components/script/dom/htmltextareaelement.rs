@@ -320,22 +320,26 @@ impl HTMLTextAreaElementMethods for HTMLTextAreaElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-textarea-value
     fn SetValue(&self, value: DOMString) {
-        let mut textinput = self.textinput.borrow_mut();
+        {
+            let mut textinput = self.textinput.borrow_mut();
 
-        // Step 1
-        let old_value = textinput.get_content();
+            // Step 1
+            let old_value = textinput.get_content();
 
-        // Step 2
-        textinput.set_content(value);
+            // Step 2
+            textinput.set_content(value);
 
-        // Step 3
-        self.value_dirty.set(true);
+            // Step 3
+            self.value_dirty.set(true);
 
-        if old_value != textinput.get_content() {
-            // Step 4
-            textinput.clear_selection_to_limit(Direction::Forward);
+            if old_value != textinput.get_content() {
+                // Step 4
+                textinput.clear_selection_to_limit(Direction::Forward);
+            }
         }
 
+        self.validity_state()
+            .update_validity_state(ValidationFlags::all());
         self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
     }
 
@@ -529,6 +533,9 @@ impl VirtualMethods for HTMLTextAreaElement {
             },
             _ => {},
         }
+
+        self.validity_state()
+            .update_validity_state(ValidationFlags::all());
     }
 
     fn bind_to_tree(&self, context: &BindContext) {
@@ -538,6 +545,9 @@ impl VirtualMethods for HTMLTextAreaElement {
 
         self.upcast::<Element>()
             .check_ancestors_disabled_state_for_form_control();
+
+        self.validity_state()
+            .update_validity_state(ValidationFlags::all());
     }
 
     fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
@@ -570,6 +580,9 @@ impl VirtualMethods for HTMLTextAreaElement {
         } else {
             el.check_disabled_attribute();
         }
+
+        self.validity_state()
+            .update_validity_state(ValidationFlags::all());
     }
 
     // The cloning steps for textarea elements must propagate the raw value
@@ -585,8 +598,12 @@ impl VirtualMethods for HTMLTextAreaElement {
         }
         let el = copy.downcast::<HTMLTextAreaElement>().unwrap();
         el.value_dirty.set(self.value_dirty.get());
-        let mut textinput = el.textinput.borrow_mut();
-        textinput.set_content(self.textinput.borrow().get_content());
+        {
+            let mut textinput = el.textinput.borrow_mut();
+            textinput.set_content(self.textinput.borrow().get_content());
+        }
+        el.validity_state()
+            .update_validity_state(ValidationFlags::all());
     }
 
     fn children_changed(&self, mutation: &ChildrenMutation) {
@@ -659,6 +676,9 @@ impl VirtualMethods for HTMLTextAreaElement {
                 event.mark_as_handled();
             }
         }
+
+        self.validity_state()
+            .update_validity_state(ValidationFlags::all());
     }
 
     fn pop(&self) {

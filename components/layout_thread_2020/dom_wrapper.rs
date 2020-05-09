@@ -881,6 +881,8 @@ impl<'le> ::selectors::Element for ServoLayoutElement<'le> {
             NonTSPseudoClass::Enabled |
             NonTSPseudoClass::Disabled |
             NonTSPseudoClass::Checked |
+            NonTSPseudoClass::Valid |
+            NonTSPseudoClass::Invalid |
             NonTSPseudoClass::Indeterminate |
             NonTSPseudoClass::ReadWrite |
             NonTSPseudoClass::PlaceholderShown |
